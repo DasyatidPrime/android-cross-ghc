@@ -1,0 +1,983 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use v5.014_000;
+use feature 'state';
+use re '/a';
+use Getopt::Long qw/:config bundling/;
+use Cwd qw/getcwd/;
+use Carp;
+use POSIX;
+use Fcntl qw/LOCK_EX LOCK_NB/;
+use Digest::SHA qw/sha256_hex sha256_base64/;
+use List::Util qw/first all/;
+use File::Copy qw/copy/;
+use File::Path qw/make_path remove_tree/;
+
+# ----------------------------------------
+# Early support routines
+
+# (Avoid taking a dependency on List::MoreUtils for just one function.)  Given a predicate (as in grep) and a
+# list, return the first index whose list item matches the predicate, or undef if no list item matches.
+sub first_index(&@) {
+    my $predicate = shift;
+    for my $i (0..$#_) {
+	local $_ = $_[$i];
+	return $i if $predicate->();
+    }
+    
+    return;
+}
+
+sub icwarn {
+    # <Incomplete> make this a continuable warning rather than hard error
+    print STDERR @_, "\n";
+    die "Aborting.\n";
+}
+
+sub iwarn {
+    print STDERR @_, "\n";
+}
+
+sub iinfo {
+    print STDERR @_, "\n";
+}
+
+# Can't use &&& prototype because that demands literal sub {} for some reason.  Hmm.
+sub unwind_protect($$$) {
+    my ($block, $after, $before) = @_;
+    $before->() if defined $before;
+    my @results = wantarray? eval { $block->() } : eval { scalar $block->() };
+    my $saved_error = $@;
+    $after->() if defined $after;
+    die $saved_error if $saved_error;
+    return wantarray? @results : $results[0];
+}
+
+sub _child_exited_normally($) {
+    my ($status) = @_;
+    return POSIX::WIFEXITED($status) && (POSIX::WEXITSTATUS($status) == 0);
+}
+
+sub _describe_child_status($) {
+    my ($status) = @_;
+    return "exited ".POSIX::WEXITSTATUS($status) if POSIX::WIFEXITED($status);
+    return "died from signal ".POSIX::WTERMSIG($status) if POSIX::WIFSIGNALED($status);
+    return "died weirdly";
+}
+
+# Run a command, specified as an array ref.  Die if it failed.
+sub run_command($) {
+    use autodie qw/fork/;
+    croak "expected array ref for command" unless ref $_[0] eq 'ARRAY';
+    my @cmd = @{$_[0]};
+    my $cwd = getcwd() // "<unknown directory>";
+    iinfo "Run (in $cwd): @cmd";
+    my $pid = fork;
+
+    if ($pid == 0) {
+	exec { $cmd[0] } @cmd or do {
+	    print STDERR "exec $cmd[0]: $!\n";
+	    POSIX::_exit(111);
+	};
+    } else {
+	my $ok = waitpid $pid, 0;
+	my $status = $?;
+	die "waitpid $_: $!\n" unless defined $ok and $ok != -1;
+	die "child $cmd[0] "._describe_child_status($status)."\n" unless _child_exited_normally($status);
+    }
+}
+
+# Python 3 outputs -V information on stdout.  But Python 2 outputs it on stderr.  Other programs might do
+# similarly foolish things.
+#
+# Run a command line and extract its _combined_ output from stdout and stderr.  Return ($output,
+# $error_status), where $output is a string and $error_status is defined iff the child process exited
+# abnormally.
+sub capture_double_output_from($) {
+    use autodie qw/fork pipe open close/;
+    croak "expected array ref" unless ref $_[0] eq 'ARRAY';
+    my @cmd = @{$_[0]};
+
+    my ($rd, $wr);
+    pipe $rd, $wr;
+    my $pid = fork;
+    if ($pid == 0) {
+	# stderr will be reopened, so don't print anything there.
+	eval {
+	    close $rd;
+	    open STDIN, '<', '/dev/null';
+	    open STDOUT, '>&', $wr;
+	    open STDERR, '>&', $wr;
+	    exec { $cmd[0] } @cmd or do {
+		POSIX::_exit(111);
+	    };
+	};
+	POSIX::_exit(111);
+    } else {
+	close $wr;
+	my $output = do { local $/ = undef; readline($rd) };
+	close $rd;
+	my $ok = waitpid $pid, 0;
+	die "waitpid: $!\n" unless defined $ok and $ok != -1;
+	my $status = $?;
+	return ($output // '', _child_exited_normally($status)? undef : $status);
+    }
+}
+
+# ----------------------------------------
+# Configuration-ish variables
+
+# Host resources
+our $SDK_Dir;
+our $NDK_Dir;
+our $NDK_Host_Pair;					 # E.g., linux-x86
+our $NDK_Target_Arch = 'arm';
+our $NDK_Target_Expanded;
+our $NDK_Target_Shortened;
+our $NDK_Platform = 'android-14';
+our $NDK_Toolchain_Variant = '4.9';
+our $Host_Python2;
+our $Host_Curl;
+
+# Build resources
+our $Automake_Helper_Dir;
+our @Automake_Helpers = qw(config.sub config.guess);
+
+# Versions of things to build
+our $GHC_Version = '7.8.3';
+our $LLVM_Version = '3.4';
+our $Libiconv_Version = '1.14';
+our $GMP_Version = '6.0.0a';
+our $Ncurses_Version = '5.9';
+
+our %Source_Groups =
+    (LLVM =>
+     { version_ref => \$LLVM_Version,
+       url_prefix => 'http://llvm.org/releases/%V/',
+       file_patterns => { main => ['llvm-%V.src.tar.gz'],
+			  clang => ['clang-%V.src.tar.gz', 'cfe-%V.src.tar.gz'] },
+       digests_sha256 =>
+       { 'llvm-3.4.src.tar.gz' => '25a5612d692c48481b9b397e2b55f4870e447966d66c96d655241702d44a2628',
+	 'clang-3.4.src.tar.gz' => '22a9780db3b85a7f2eb9ea1f7f6e00da0249e3d12851e8dea0f62f1783242b1b',
+       },
+     },
+     
+     GHC =>
+     { version_ref => \$GHC_Version,
+       url_prefix => 'http://www.haskell.org/ghc/dist/%V/',
+       file_patterns => { main => ['ghc-%V-src.tar.xz'] },
+       digests_sha256 =>
+       { 'ghc-7.8.3-src.tar.xz' => 'b0cd96a549ba3b5e512847a4a8cd1a3174e4b2b75dadfc41c568fb812887b958',
+       },
+     },
+     
+     Libiconv =>
+     { version_ref => \$Libiconv_Version,
+       url_prefix => 'http://ftp.gnu.org/pub/gnu/libiconv/',
+       file_patterns => { main => ['libiconv-%V.tar.gz'] },
+       digests_sha256 =>
+       { 'libiconv-1.14.tar.gz' => '72b24ded17d687193c3366d0ebe7cde1e6b18f0df8c55438ac95be39e8a30613',
+       },
+     },
+     
+     GMP =>
+     { version_ref => \$GMP_Version,
+       url_prefix => 'https://gmplib.org/download/gmp/',
+       file_patterns => { main => ['gmp-%V.tar.xz'] },
+       digests_sha256 =>
+       { 'gmp-6.0.0a.tar.xz' => '9156d32edac6955bc53b0218f5f3763facb890b73a835d5e1b901dcf8eb8b764',
+       },
+     },
+     
+     Ncurses =>
+     { version_ref => \$Ncurses_Version,
+       url_prefix => 'http://ftp.gnu.org/pub/gnu/ncurses/',
+       file_patterns => { main => ['ncurses-%V.tar.gz'] },
+       digests_sha256 =>
+       { 'ncurses-5.9.tar.gz' => '9046298fb440324c9d4135ecea7879ffed8546dd1b58e59430ea07a4633f563b',
+       },
+     }
+    );
+
+our %NDK_Targets_Expanded =
+    (
+     aarch64 => 'aarch64-linux-android',
+     amd64 => 'x86_64-linux-android',
+     arm => 'arm-linux-androideabi',
+     arm64 => 'aarch64-linux-android',
+     i686 => 'i686-linux-android',
+     mips => 'mipsel-linux-android',
+     mips64 => 'mips64el-linux-android',
+     x86 => 'i686-linux-android',
+     x86_64 => 'x86_64-linux-android'
+    );
+
+# <Dependency> can this track the NDK better directly somehow?
+our @Known_Arches = qw(aarch64 arm mips mips64 x86 x86_64);
+defined $NDK_Targets_Expanded{$_} or die "inconsistent internal data" for @Known_Arches;
+
+our %NDK_Targets_Shortened =
+    (
+     'i686-linux-android' => 'x86',
+     'x86_64-linux-android' => 'x86_64',
+    );
+
+# Options
+our $Reset_Umask = 0;
+our $Download_Source = 0;
+our $Check_Digests = 1;
+our $Allow_Dangerously_Not_Checking_Digests_Even_When_Downloading = 0;
+our $Download_Mechanism = 'curl';
+our $GHC_Heap_Size_Mebibytes;
+our @Make_Command = ('make');
+our $Make_Parallel = 1;
+our @Make_Options = ();
+
+# See %Stages below.  This is not equivalent to (keys %Stages) because the order matters.
+our @All_Stages = qw(ndk llvm libiconv gmp ncurses ghc);
+our @Run_Stages = @All_Stages;
+
+# Directory configuration
+our $Cache_Dir = do {
+    my $xdg_cache_dir =
+	(defined $ENV{XDG_CACHE_HOME} && length $ENV{XDG_CACHE_HOME})? $ENV{XDG_CACHE_HOME} :
+	(defined $ENV{HOME} && length $ENV{HOME})? "$ENV{HOME}/.cache" :
+	undef;
+    defined($xdg_cache_dir)? "$xdg_cache_dir/android-cross-ghc" : undef;
+};
+our ($Source_Dir, $Build_Dir, $Install_Dir);
+
+# This should be called after option processing.  Various sanity checks and defaults
+# happen here.
+#
+# <Fragile> Some defaults actually happen before this, above, so that the usage message
+# can include them.  D'oh.
+sub initialize_vars() {
+    if ($Download_Source && !$Check_Digests && !$Allow_Dangerously_Not_Checking_Digests_Even_When_Downloading) {
+	die "ah ah ah, you didn't say the magic word (this operation is very dangerous!  See --help)\n";
+    }
+    
+    if ($Make_Parallel <= 0) {
+	die "Cannot use nonpositive number of jobs for parallel build\n";
+    } elsif ($Make_Parallel > 1) {
+	push @Make_Options, "-j$Make_Parallel";
+    }
+
+    $SDK_Dir //= $ENV{ANDROID_SDK_HOME} // "/opt/android";
+    my $sdk_test_file = 'tools/android';
+    unless (POSIX::access("$SDK_Dir/$sdk_test_file", POSIX::X_OK())) {
+	icwarn "No executable $sdk_test_file found in $SDK_Dir; this doesn't look like an Android SDK";
+    }
+    
+    $NDK_Dir //= $ENV{NDK_ROOT} // "/opt/android/ndk";
+    my $ndk_test_file = 'ndk-build';
+    unless (POSIX::access("$NDK_Dir/$ndk_test_file", POSIX::X_OK())) {
+	icwarn "No executable $ndk_test_file found in $NDK_Dir; this doesn't look like an Android NDK";
+    }
+   
+    $NDK_Host_Pair //= do {
+	my ($kernel, $machine) = (POSIX::uname())[0, 4];
+	my $ndk_kernel = lc $kernel;
+	my $ndk_machine = do {
+	    if ($machine =~ /\Ai\d86\z/) {
+		'x86';
+	    } elsif ($machine eq 'x86_64') {
+		'x86_64';
+	    } else {
+		lc $machine;
+	    }
+	};
+
+	"$ndk_kernel-$ndk_machine";
+    };
+
+    if (defined $NDK_Targets_Expanded{$NDK_Target_Arch}) {
+	$NDK_Target_Expanded = $NDK_Targets_Expanded{$NDK_Target_Arch};
+    } elsif (index($NDK_Target_Arch, '-') >= 0) {
+	$NDK_Target_Expanded = $NDK_Target_Arch;
+	$NDK_Target_Arch = (split /-/, $NDK_Target_Arch)[0];
+	unless (any { $_ eq $NDK_Target_Expanded } values %NDK_Targets_Expanded) {
+	    iwarn "Not sure we know what configuration '$NDK_Target_Expanded' is, but continuing anyway";
+	}
+    } else {
+	die "Don't know what architecture '$NDK_Target_Arch' is\n";
+    }
+    
+    $NDK_Target_Shortened = $NDK_Targets_Shortened{$NDK_Target_Expanded} // $NDK_Target_Expanded;
+
+    $Automake_Helper_Dir //= do {
+	my @candidates = glob "/usr/share/automake-*";
+	my $best_candidate =
+	    first { my $dir = $_; all { POSIX::access("$dir/$_", POSIX::R_OK()) } @Automake_Helpers }
+	    # Version number sort, ish.
+	    map { $$_[0] } sort { $$a[1] cmp $$b[1] }
+	    map { [$_, /([0-9.]+)\z/? pack('w*', split /\./, $1) : ""] }
+	    @candidates;
+	$best_candidate;
+    };
+
+    $Host_Python2 //= do {
+	my @path = split /:/, $ENV{PATH};
+	my $first_acceptable =
+	    first { acceptable_looking_python2($_) }
+	    map { ("$_/python2", "$_/python") } @path;
+	$first_acceptable;
+    };
+
+    if ($Download_Source) {
+	$Host_Curl //= do {
+	    my @path = split /:/, $ENV{PATH};
+	    my $first_acceptable =
+		first { acceptable_looking_curl($_) }
+		map { "$_/curl" } @path;
+	};
+    }
+
+    $Install_Dir //= "$SDK_Dir/add-ons/addon-ghc-$GHC_Version-$NDK_Target_Shortened-$NDK_Toolchain_Variant-$NDK_Platform";
+    $Source_Dir //= "$Cache_Dir/source";
+    # <Future> use a subdirectory based on the build configuration
+    $Build_Dir //= "$Cache_Dir/build";
+
+    $GHC_Heap_Size_Mebibytes //= reasonable_ghc_heap_size_mebibytes();
+}
+
+# ----------------------------------------
+# Later support routines
+
+# Given an executable, return true iff it looks like a viable curl to use for downloading source archives.
+# This checks to see whether it responds to --version and supports http and https.
+sub acceptable_looking_curl($) {
+    my ($exe) = @_;
+    return 0 unless POSIX::access($exe, POSIX::X_OK());
+    my ($version_output, $child_error) = do {
+	local $ENV{LC_ALL} = 'C';
+	capture_double_output_from([$exe, '--version']);
+    };
+    return 0 if defined $child_error;
+    $version_output =~ /^Protocols:\s+([^\n]+)$/m or return 0;
+    my %protocols = map { $_ => 1 } split /\s+/, $1;
+    defined $protocols{http} and defined $protocols{https} or return 0;
+    return 1;
+}
+
+# Given an executable, return true iff it looks like a viable Python 2.  This extracts the major version
+# from the output of -V.
+sub acceptable_looking_python2($) {
+    my ($exe) = @_;
+    return 0 unless POSIX::access($exe, POSIX::X_OK());
+    if (POSIX::access($exe =~ s|/[^/]+\z|/activate_this.py|r, POSIX::R_OK())) {
+	# <Incomplete> make this configurable
+	iwarn "Skipping $exe, which seems to be inside a virtualenv";
+	return 0;
+    }
+
+    my ($version_output, $child_error) = do {
+	local $ENV{LC_ALL} = 'C';
+	capture_double_output_from([$exe, '-V']);
+    };
+    return 0 if defined $child_error;
+    return 0 unless $version_output =~ /\s(\d+)/ and int($1) == 2;
+    return 1;
+}
+
+# Estimate a reasonable heap size to use when running GHC, in mebibytes.  The defaults set in the GHC build
+# system are something tiny like 32 MiB; it seems advantageous to up that on modern systems.
+sub reasonable_ghc_heap_size_mebibytes() {
+    my $available_memory_mebibytes;
+    my $meminfo_fh;
+    {
+	open $meminfo_fh, '<', '/proc/meminfo' or last;
+	local $_;
+	while (<$meminfo_fh>) {
+	    if (/^MemAvailable:\s+(\d+)\s+kB/) {
+		$available_memory_mebibytes = int($1) / 1024.0;
+	    }
+	}
+    }
+    close $meminfo_fh if defined $meminfo_fh;
+
+    # Undefined means use whatever the existing Makefile used as a default.
+    return unless defined $available_memory_mebibytes;
+    
+    my $mebibytes_per_job_ish = $available_memory_mebibytes / $Make_Parallel;
+    # Greater than 1024 might yield too little cache locality?  Haven't profiled; guessing
+    # that the default heap size is usually too small for modern machines though.
+    return 1024 if $mebibytes_per_job_ish >= 2048;
+    return int($mebibytes_per_job_ish / 2);
+}
+
+sub with_umask($$) {
+    my ($umask, $block) = @_;
+    my $saved_umask;
+    my $before = sub { $saved_umask = umask $umask };
+    my $after = sub { umask $saved_umask };
+    return unwind_protect($block, $after, $before);
+}
+
+# Execute a block with the desired umask for install set, respecting the user's --reset-umask
+# option or its opposite.
+sub with_install_umask(&) {
+    return $Reset_Umask? with_umask(0022, $_[0]) : $_[0]->();
+}
+
+# Execute a block with a restrictive umask that allows access only for the current user.
+sub with_restrictive_umask(&) {
+    return with_umask(0077, $_[0]);
+}
+
+# Execute a block in a subdirectory.
+sub with_chdir($&) {
+    use autodie qw/opendir closedir chdir/;
+    my ($new_dir, $block) = @_;
+    my $saved_dir;
+    my $before = sub { opendir $saved_dir, '.'; chdir $new_dir };
+    my $after = sub { chdir $saved_dir; closedir $saved_dir };
+    return unwind_protect($block, $after, $before);
+}
+
+# Execute a block with a filehandle selected as the default for output.
+sub with_selected_handle($&) {
+    # <Fragile,low> Does not catch select() errors
+    my ($handle, $block) = @_;
+    my $saved_select;
+    my $before = sub { $saved_select = select $handle };
+    my $after = sub { select $saved_select };
+    return unwind_protect($block, $after, $before);
+}
+
+# ----------------------------------------
+# General build routines
+
+# Given a string which may include any of the placeholders below, substitute the appropriate values for the
+# given source group.  Expandos:
+#   %V - desired version of this dependency
+sub expand_string_for_source_group($$) {
+    my ($source_group, $string) = @_;
+    my $version = ${$Source_Groups{$source_group}{version_ref}};
+    my %expandos = (V => $version);
+    return $string =~ s|\%([[:alnum:]])|$expandos{$1} // croak "bad source candidate expando: $1"|ger;
+}
+
+# Given ($source_group, $filename, $target_path), attempt to download $filename from the group $source_group
+# with output to $target_path.  The source group name determines the source URL to use.  Die if we couldn't
+# download the file.
+sub download_source($$$) {
+    my ($source_group, $filename, $target_path) = @_;
+    my $url_prefix = expand_string_for_source_group($source_group, $Source_Groups{$source_group}{url_prefix});
+    my $url = $url_prefix . $filename;
+    
+    if ($Download_Mechanism eq 'curl') {
+	run_command([$Host_Curl, '-L', '-f', '-o', $target_path, '--', $url]);
+    } else {
+	croak "unknown download mechanism '$Download_Mechanism'";
+    }
+}
+
+# Given ($source_group, $filename, $path), ensure that the file at $path contains a valid $filename from
+# $source_group by computing and verifying its SHA-256 digest.  Return true iff the digest was valid;
+# otherwise, complain to the user and return false.
+sub check_source_digest($$$) {
+    use autodie qw/open binmode read close/;
+    my ($source_group, $filename, $found_path) = @_;
+    my $algo = 'sha256';
+    my $expected_hexdigest = $Source_Groups{$source_group}{"digests_$algo"}{$filename};
+    unless (defined $expected_hexdigest) {
+	iwarn "No expected digest found for $source_group file $filename";
+	return 0;
+    }
+
+    my $digest = Digest::SHA->new($algo);
+    open my $fh, '<', $found_path;
+    binmode $fh;
+    $digest->addfile($fh);
+    close $fh;
+    
+    my $ok = $digest->hexdigest eq $expected_hexdigest;
+    return 1 if $ok;
+    iwarn "File has $algo digest ".$digest->hexdigest.", expected ".$expected_hexdigest;
+    return 0;
+}
+
+# Given ($source_group, $file_pattern_id), pick the first candidate that we can actually retrieve (either a
+# pre-existing file, or, if $Download_Source is turned on, one downloaded from the network) and unpack it into
+# an appropriate build directory.  Return the path to the build directory.
+sub unpack_source($$) {
+    my ($source_group, $file_pattern_id) = @_;
+    my ($found_short, $found_path);
+    my $directory = "$Source_Dir/$source_group";
+    make_path($directory);
+    my @candidates =
+	map { expand_string_for_source_group($source_group, $_) }
+	@{$Source_Groups{$source_group}{file_patterns}{$file_pattern_id}};
+
+    for my $candidate (@candidates) {
+	my $full_candidate = "$directory/$candidate";
+	if (!-e $full_candidate and $Download_Source) {
+	    download_source($source_group, $candidate, $full_candidate);
+	}
+	
+	if (-e $full_candidate) {
+	    $found_short = $candidate;
+	    $found_path = $full_candidate;
+	    last;
+	}
+    }
+
+    unless (defined $found_path) {
+	# <Incomplete> should allow interactive retry
+	croak "no viable candidate for $source_group/{".join(',', @candidates)."}";
+    }
+
+    if ($Check_Digests) {
+	my $ok = check_source_digest($source_group, $found_short, $found_path);
+	unless ($ok) {
+	    icwarn "Cannot verify integrity of $found_short";
+	}
+    }
+
+    my @decompress_option;
+    $found_short =~ /\.tar(|\.gz|\.xz)/ or die "don't know how to unpack $found_short";
+    my ($suffix, $basename) = ($1, substr($found_short, 0, $-[0]));
+    @decompress_option = @{({'' => [], '.gz' => ['-z'], '.xz' => ['-J']})->{$suffix}};
+    my $new_dir = $Build_Dir.'/'.($basename =~ s/[-.]src\z//ir);
+    # <Fragile> guard against bogus tar files?
+    # <Dependency> assumes GNU tar
+    remove_tree($new_dir);
+    make_path($new_dir);
+    run_command([qw[tar --strip-components=1 -xC], $new_dir, @decompress_option, '-f', $found_path]);
+    return $new_dir;
+}
+
+# Run make and make install in sequence with appropriate options and umasks.
+sub make_and_install() {
+    run_command([@Make_Command, @Make_Options]);
+    with_install_umask sub {
+	run_command([@Make_Command, @Make_Options, 'install']);
+    };
+}
+
+# Copy new Automake helper files from an updated host Automake into a specified target directory, or
+# the current directory if none is specified.  These are needed because the Android target triples are
+# relatively recent and not all upstream sources may have Automake helpers that recognize them.
+sub update_automake_helpers(;$) {
+    my ($subdir) = @_;
+    $subdir //= ".";
+    for my $helper (@Automake_Helpers) {
+	copy("$Automake_Helper_Dir/$helper", "./$subdir/$helper") or die "copying $helper: $!\n";
+    }
+}
+
+# Use a block to update zero or more files in-place, similarly to perl -pi.  The block may modify $_,
+# print additional text, etc. for each line in the original file.
+sub inplace_update_files($&) {
+    use autodie qw/open close rename/;
+    my ($files_ref, $block) = @_;
+
+    for my $file (@$files_ref) {
+	my ($in, $tmp);
+	local $_;
+	open $in, '<', $file;
+	open $tmp, '>', "$file.tmp$$";
+	my $saved_select;
+	with_selected_handle $tmp, sub {
+	    while (<$in>) {
+		$block->();
+		print;
+	    }
+	};
+
+	close $in;
+	close $tmp;
+	rename "$file.tmp$$", $file;
+    }
+}
+
+# Execute configure in such a way as to cross-compile a library for the standalone NDK toolchain that
+# has already been installed.
+sub configure_cross_library(;$) {
+    my ($extra_args) = @_;
+    $extra_args //= [];
+    # <Dependency> assumes NDK toolchain is a GCC variant
+    run_command(['./configure',
+		 "--prefix=$Install_Dir/sysroot/usr",
+		 "--host=$NDK_Target_Expanded",
+		 "--with-sysroot=$Install_Dir/sysroot",
+		 # See the README.md file for the possible copyright implications
+		 # of these flags.
+		 "--enable-static", "--disable-shared",
+		 @$extra_args,
+		 "CC=$NDK_Target_Expanded-gcc",
+		 "CXX=$NDK_Target_Expanded-c++",
+		]);
+}
+
+# ----------------------------------------
+# Specific build routines
+
+# Use the NDK standalone toolchain script to copy a suitable standalone toolchain out into the
+# install directory.
+sub install_ndk_standalone_toolchain() {
+    with_install_umask sub {
+	run_command(["$NDK_Dir/build/tools/make-standalone-toolchain.sh",
+		     "--toolchain=$NDK_Target_Shortened-$NDK_Toolchain_Variant",
+		     "--platform=$NDK_Platform",
+		     "--install-dir=$Install_Dir"]);
+    };
+}
+
+# Build and install a cross-codegenning LLVM toolchain, including clang.
+sub install_llvm() {
+    use autodie qw/rename/;
+    my $llvm_dir = unpack_source('LLVM', 'main');
+    my $cfe_dir = unpack_source('LLVM', 'clang');
+    rename $cfe_dir, "$llvm_dir/tools/clang";
+    with_chdir $llvm_dir, sub {
+	local $ENV{PATH} = "$Install_Dir/bin:$ENV{PATH}";
+	update_automake_helpers();
+	run_command(['./configure',
+		     "--prefix=$Install_Dir",
+		     "--target=$NDK_Target_Expanded",
+		     "--with-python=$Host_Python2"]);
+	make_and_install();
+    };
+}
+
+# Build and install libiconv for the target.
+sub install_libiconv() {
+    my $libiconv_dir = unpack_source('Libiconv', 'main');
+    with_chdir $libiconv_dir, sub {
+	local $ENV{PATH} = "$Install_Dir/bin:$ENV{PATH}";
+	# The Automake helpers are in different places here than usual.
+	update_automake_helpers('build-aux');
+	update_automake_helpers('libcharset/build-aux');
+	configure_cross_library();
+	make_and_install();
+    };
+}
+
+# Build and install GMP for the target.
+sub install_gmp() {
+    my $gmp_dir = unpack_source('GMP', 'main');
+    with_chdir $gmp_dir, sub {
+	local $ENV{PATH} = "$Install_Dir/bin:$ENV{PATH}";
+	update_automake_helpers();
+	configure_cross_library(['--without-readline']);
+	make_and_install();
+    };
+}
+
+# Alter an unpacked ncurses source directory as needed; see comments inside the procedure.
+sub patch_ncurses() {
+    -e "include/curses.h.in" or die "patch_ncurses being called in wrong directory?!\n";
+
+    # We don't actually have the kind of locale.h that the ncurses build wants, so force
+    # the compilation to ignore it.
+    inplace_update_files ["include/ncurses_cfg.h"], sub {
+	s/^(#define HAVE_LOCALE_H)(\s+\d+)/$1 0/;
+    };
+}
+
+# Build and install ncurses for the target.
+sub install_ncurses() {
+    my $ncurses_dir = unpack_source('Ncurses', 'main');
+    with_chdir $ncurses_dir, sub {
+	local $ENV{PATH} = "$Install_Dir/bin:$ENV{PATH}";
+	update_automake_helpers();
+	# No reason to install the man pages into a cross-environment.
+	configure_cross_library(['--without-manpages']);
+	patch_ncurses();
+	make_and_install();
+    };
+}
+
+sub patch_ghc() {
+    -e "ghc.mk" or die "patch_ghc being called in wrong directory?!\n";
+
+    # We probably need to set the build flavour explicitly for a cross-GHC.
+    copy('mk/build.mk.sample', 'mk/build.mk') or die "copying mk/build.mk: $!";
+    inplace_update_files ['mk/build.mk'], sub {
+	# Set BuildFlavour early and suppress any extra BuildFlavour.
+	print "BuildFlavour=quick-cross\n" if $. == 1;
+	my $set_var = /^\s*(\S+)\s*=/? $1 : '';
+	$_ = "#$_" if $set_var eq 'BuildFlavour';
+
+	# Set the Haskell heap size to use while compiling.
+	if ($set_var eq 'SRC_HC_OPTS' and defined $GHC_Heap_Size_Mebibytes) {
+	    s/(?<=\s)-H(\d+)m(?=\s)/-H${GHC_Heap_Size_Mebibytes}m/;
+	}
+    };
+
+    # Some of these packages introduce unwanted dependencies on terminal information and other system support
+    # stuff.  We don't seem to need these for useful Haskell support executables on Android (we're not
+    # targeting making it possible to write entire terminal-based Haskell apps on Android at the moment), so
+    # disable these.
+    my %skip_packages_stage1 = map { $_ => 1 } qw(xhtml terminfo haskeline);
+    inplace_update_files ['ghc.mk'], sub {
+	if (/^PACKAGES_STAGE1\s*\+=\s*(\S+)\s*/) {
+	    my ($package, $to_eol) = ($1, substr($_, $+[0]));
+	    # Don't comment out unrelated packages.
+	    die "Unsupported line patching ghc.mk: $_" if $to_eol =~ /\S/;
+	    $_ = "#$_" if defined $skip_packages_stage1{$package};
+	}
+    };
+
+    # EPOLLONESHOT isn't available in the target system, so replace it with a usable
+    # hardcoded value.
+    inplace_update_files ['libraries/base/GHC/Event/EPoll.hsc'], sub {
+	s|\bEPOLLONESHOT\b|0x40000000|g;
+    };
+
+    # _POSIX_VDISABLE isn't available in the target system, so replace it with a usable
+    # hardcoded value.
+    inplace_update_files ['libraries/unix/System/Posix/Terminal/Common.hsc'], sub {
+	s|\b_POSIX_VDISABLE\b|'\\0'|g;
+    };
+
+    # System.Posix.Files.Common fails to import some of the types it needs if certain
+    # other unclear ifdefs don't trigger, so unconditionally import them.
+    inplace_update_files ['libraries/unix/System/Posix/Files/Common.hsc'], sub {
+	state $already = 0;
+	if (!$already && /^import /) {
+	    print "import Data.Int\n";
+	    print "import Data.Ratio\n";
+	    $already++;
+	}
+    };
+}
+
+# Build and install the cross-GHC itself.
+sub install_ghc() {
+    use autodie qw/open close/;
+
+    my $ghc_dir = unpack_source('GHC', 'main');
+    with_chdir $ghc_dir, sub {
+	local $ENV{PATH} = "$Install_Dir/bin:$ENV{PATH}";
+	# We need to point this both at the target GCC and the target LLVM, right?
+	# Is that right?  Hmm.
+	run_command(['./configure',
+		     "--prefix=$Install_Dir",
+		     "--target=$NDK_Target_Expanded",
+		     # <Uncertain>
+		     #"--with-gcc=$NDK_Target_Triple-gcc",
+		     "--with-gcc=$Install_Dir/bin/$NDK_Target_Expanded-gcc",
+		     "--with-llc=$Install_Dir/bin/$NDK_Target_Expanded-llc",
+		     "--with-opt=$Install_Dir/bin/$NDK_Target_Expanded-opt",
+		     "--with-sysroot=$Install_Dir/sysroot"]);
+	patch_ghc();
+
+	run_command([@Make_Command, @Make_Options]);
+	with_install_umask sub {
+	    run_command([@Make_Command, @Make_Options, 'install']);
+	};
+    };
+}
+
+# ----------------------------------------
+# Option processing and driver
+
+# See @Run_Stages and @All_Stages above.
+our %Stages =
+    (ndk => \&install_ndk_standalone_toolchain,
+     llvm => \&install_llvm,
+     libiconv => \&install_libiconv,
+     gmp => \&install_gmp,
+     ncurses => \&install_ncurses,
+     ghc => \&install_ghc);
+
+# Return the index of a stage in @Run_Stages, given its name, or die if it wasn't found.
+sub find_stage_index($) {
+    my ($name) = @_;
+    my $index = first_index { $_ eq $name } @Run_Stages;
+    die "stage '$name' not in list to run\n" unless defined $index;
+    return $index;
+}
+
+# Ensure the argument is actually the name of a stage, and die otherwise.
+sub ensure_stage($) {
+    my ($name) = @_;
+    die "stage '$name' not recognized\n" unless defined $Stages{$name};
+    return $name;
+}
+
+# Given ($start, $end), set @Run_Stages to only use stages currently numbered $start through $end inclusive,
+# where $end may be negative to specify from the end.
+sub set_stages_slice($$) {
+    my ($start, $end) = @_;
+    $end = @Run_Stages + $end if $end < 0;
+    @Run_Stages = @Run_Stages[$start..$end];
+}
+
+sub list_sources() {
+    my $list_cache_dir = $Cache_Dir // "<cache-dir>";
+    print "Place the following files in $list_cache_dir/source:\n";
+    for my $group (sort keys %Source_Groups) {
+	my $record = $Source_Groups{$group};
+	print "  $group/\n";
+	for my $patterns_ref (values %{$$record{file_patterns}}) {
+	    my @filenames = map { expand_string_for_source_group($group, $_) } @$patterns_ref;
+	    print "    ", join(' | ', @filenames), "\n";
+	}
+    }
+}
+
+sub main {
+    my $usage_cache_dir = $Cache_Dir // "none found!";
+    my $usage = <<"EOF";
+Usage: $0 [options]
+Stages: @All_Stages
+Known architectures: @Known_Arches
+
+Options:
+  --prefix=DIRECTORY
+    Install to this directory.  Defaults to a directory under the Android
+    SDK add-ons directory named depending on the target options.
+
+  --cache-dir=DIRECTORY (default: $usage_cache_dir)
+    Expect source files in the 'source' subdirectory of this directory (or
+    download them there if --download is also given), and place intermediary
+    build files in the 'build' subdirectory of this directory.  All of these
+    directories are created if they do not already exist.
+
+  --platform=PLATFORM (default: $NDK_Platform)
+    Set up the standalone NDK toolchain in the install directory to target
+    this Android platform (API level).
+
+  --arch=ARCH (default: $NDK_Target_Arch)
+    Target this architecture.  Recognized architectures are listed above.
+
+  --with-android-sdk=DIR
+    Specify path to the top directory of the installed Android SDK.
+    This defaults to \$ANDROID_SDK_HOME or /opt/android if unspecified.
+
+  --with-android-ndk=DIR
+    Specify path to the top directory of the installed Android NDK.
+    This defaults to \$NDK_ROOT or /opt/android/ndk if unspecified.
+
+  --list-sources
+    List files expected to be in <cache-dir>/source, along with their
+    digests.
+
+  --download@{[$Download_Source? " (default)" : ""]}
+  --no-download@{[$Download_Source? "" : " (default)"]}
+    Attempt to download upstream source archives as needed.  Otherwise,
+    this expects source archives to already be present in the cache
+    directory.  Automatic downloading requires curl to be present on the
+    host.
+
+  --verify@{[$Check_Digests? " (default)" : ""]}
+  --no-verify@{[$Check_Digests? "" : " (default)"]}
+    Verify hardcoded expected SHA-256 digests of source archives before
+    unpacking.  If you wish to set --no-verify with --download, you
+    must supply an argument derived from reading the source code of
+    this script.
+
+  -jN, --parallel-build=N
+    Pass options to make to run up to N jobs at once, where supported.
+
+  --reset-umask@{[$Reset_Umask? " (default)" : ""]}
+  --no-reset-umask@{[$Reset_Umask? "" : " (default)"]}
+    Reset the umask to 022 before creating files in the target
+    directory, so that they will be created world-readable unless
+    otherwise constrained (e.g., by a default ACL or by permissions
+    on existing parent directories).
+
+  --only-stages=STAGE[,STAGE...]
+  --skip-stages=STAGE[,STAGE...]
+  --start-from=STAGE, --start-after=STAGE
+  --stop-before=STAGE, --stop-after=STAGE
+    Only perform some stages of the build process.  Stage names are
+    listed above.  This is mainly useful for debugging the managing
+    build script itself.  If you specify a nonsensical combination
+    of stages, things will probably go wrong.
+
+Environment variables:
+
+  HOME, XDG_CACHE_HOME - see the XDG Base Directory Specification
+  ANDROID_SDK_HOME - top directory for the Android SDK
+  NDK_ROOT - top directory for the Android NDK
+EOF
+
+    GetOptions(
+	       'reset-umask' => sub { $Reset_Umask = 1 },
+	       'no-reset-umask' => sub { $Reset_Umask = 0 },
+	       'download' => sub { $Download_Source = 1 },
+	       'no-download' => sub { $Download_Source = 0 },
+	       'list-sources' => sub { list_sources(); exit 0 },
+	       'verify' => sub { $Check_Digests = 1 },
+	       'no-verify:s' => sub {
+		   $Check_Digests = 0;
+		   if (defined $_[1]
+		       and sha256_base64($_[1]) eq 'dPygMltf2zo0uttAolgc+9U0QYfo00MpUqWrwJKcEkY') {
+		       $Allow_Dangerously_Not_Checking_Digests_Even_When_Downloading = 1;
+		   }
+	       },
+	       'parallel-build|j=i' => \$Make_Parallel,
+	       'platform=s' => \$NDK_Platform,
+	       'arch|architecture=s' => \$NDK_Target_Arch,
+	       'prefix=s' => \$Install_Dir,
+	       'cache-dir=s' => \$Cache_Dir,
+	       'with-android-sdk=s' => \$SDK_Dir,
+	       'with-android-ndk=s' => \$NDK_Dir,
+	       'only-stage|only-stages=s' => sub {
+		   @Run_Stages = map { ensure_stage($_) } split /,/, $_[1];
+	       },
+	       'skip-stage|skip-stages=s' => sub {
+		   my %skip = map { ensure_stage($_) => 1 } split /,/, $_[1];
+		   @Run_Stages = grep { !exists $skip{$_} } @Run_Stages;
+	       },
+	       'stop-before=s' => sub { set_stages_slice(0, find_stage_index($_[1])-1) },
+	       'stop-after=s' => sub { set_stages_slice(0, find_stage_index($_[1])) },
+	       'start-from=s' => sub { set_stages_slice(find_stage_index($_[1]), -1) },
+	       'start-after=s' => sub { set_stages_slice(find_stage_index($_[1])+1, -1) },
+	       'help' => sub { print $usage; exit 0 },
+	      ) or die $usage;
+
+    # This does have to come after the GetOptions; it respects already-set vars where
+    # reasonable.  Various sanity checks are also in here.
+    initialize_vars();
+
+    # The lock filehandle must stay open, and therefore must stay outside the block.
+    my $lock_fh;
+    {
+	use autodie qw/chdir chmod open/;
+
+	with_install_umask sub {
+	    make_path($Install_Dir)
+	};
+
+	# The chmods are in case the directories already exist.  We assume no one else can meddle with these
+	# directories, as we execute a bunch of stuff in there.
+	with_restrictive_umask sub {
+	    make_path($Source_Dir);
+	    make_path($Build_Dir);
+	    chmod 0700, $Source_Dir;
+	    chmod 0700, $Build_Dir;
+	};
+	
+	chdir $Build_Dir;
+	open $lock_fh, '>>', 'lockfile';
+	my $lock_ok = flock $lock_fh, LOCK_EX | LOCK_NB;
+	if (!$lock_ok) {
+	    icwarn "Can't acquire lock on $Build_Dir/lockfile";
+	}
+    }
+
+    for my $stage (@Run_Stages) {
+	$Stages{$stage}->();
+    }
+
+    if ("@Run_Stages" eq "@All_Stages") {
+	iinfo "Done.  New tools installed into: $Install_Dir";
+    } else {
+	iinfo "Partial build complete.  Eventual install directory: $Install_Dir";
+    }
+}
+
+main();
+
+# Local variables:
+# mode: cperl
+# fill-column: 110
+# comment-column: 57
+# End:
