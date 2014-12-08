@@ -2,7 +2,7 @@
 
 This repository contains a build script intended to build a version of
 [GHC](https://www.haskell.org/ghc/) (the Glorious Glasgow Haskell
-Compilation System) that can compile executables compatible with an
+Compilation System) capable of compiling executables compatible with an
 existing installation of the [Android
 NDK](http://developer.android.com/tools/sdk/ndk/index.html).
 
