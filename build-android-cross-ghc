@@ -311,7 +311,7 @@ sub initialize_vars() {
 	my $best_candidate =
 	    first { my $dir = $_; all { POSIX::access("$dir/$_", POSIX::R_OK()) } @Automake_Helpers }
 	    # Version number sort, ish.
-	    map { $$_[0] } sort { $$a[1] cmp $$b[1] }
+	    map { $$_[0] } sort { $$b[1] cmp $$a[1] }
 	    map { [$_, /([0-9.]+)\z/? pack('w*', split /\./, $1) : ""] }
 	    @candidates;
 	$best_candidate;
