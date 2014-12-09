@@ -10,12 +10,36 @@ use Carp;
 use POSIX;
 use Fcntl qw/LOCK_EX LOCK_NB/;
 use Digest::SHA qw/sha256_hex sha256_base64/;
-use List::Util qw/first all/;
+# See below.
+#no List::Util;
 use File::Copy qw/copy/;
 use File::Path qw/make_path remove_tree/;
 
 # ----------------------------------------
 # Early support routines
+
+# Apparently, people get tempted to install newer versions of List::Util from CPAN over top of older ones in
+# distributions that use older releases that don't have all() or such.  And apparently, when they do this, and
+# maybe in some other cases because who knows when the underlying XS is that hairy, some of the functions
+# start returning bogus values.  In particular, first { } map { } sort { } map { } starts returning undef even
+# though $_ in the first-block is fine and it returns true for at least one of the items.
+#
+# So never mind.  Implement them in Perl.
+
+# Given a $_-predicate and a list, return the first item that matches the predicate, or undef if no item
+# matches.
+sub first(&@) {
+    my $predicate = shift;
+    $predicate->() and return $_ for @_;
+    return;
+}
+
+# Given a $_-predicate and a list, return true if every item in the list matches the predicate.
+sub all(&@) {
+    my $predicate = shift;
+    $predicate->() or return 0 for @_;
+    return 1;
+}
 
 # (Avoid taking a dependency on List::MoreUtils for just one function.)  Given a predicate (as in grep) and a
 # list, return the first index whose list item matches the predicate, or undef if no list item matches.
